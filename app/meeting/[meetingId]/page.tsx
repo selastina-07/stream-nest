@@ -7,8 +7,76 @@ import { io, Socket } from "socket.io-client";
 type Peer = { id: string; stream: MediaStream; name: string };
 type ChatMessage = { id: string; sender: string; text: string; mine?: boolean };
 type Signal = { from: string; offer?: RTCSessionDescriptionInit; answer?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit };
+type MirroredVideoOutput = { track: MediaStreamTrack; stop: () => void };
 
 const ICE_SERVERS: RTCConfiguration = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }] };
+const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: false,
+};
+
+async function createMirroredVideoOutput(sourceTrack: MediaStreamTrack): Promise<MirroredVideoOutput> {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.setAttribute("aria-hidden", "true");
+  video.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none";
+  video.srcObject = new MediaStream([sourceTrack]);
+  document.body.append(video);
+  await video.play();
+
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (!context || typeof canvas.captureStream !== "function") {
+    video.pause();
+    video.srcObject = null;
+    video.remove();
+    throw new Error("This browser cannot create a mirrored camera track.");
+  }
+
+  if (!video.videoWidth || !video.videoHeight) {
+    await new Promise<void>((resolve) => video.addEventListener("loadeddata", () => resolve(), { once: true }));
+  }
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const drawFrame = () => {
+    if (video.videoWidth && video.videoHeight) {
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+      context.save();
+      context.translate(canvas.width, 0);
+      context.scale(-1, 1);
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      context.restore();
+    }
+  };
+  drawFrame();
+  const timer = window.setInterval(drawFrame, 1000 / 30);
+
+  const outputStream = canvas.captureStream(30);
+  const outputTrack = outputStream.getVideoTracks()[0];
+  if (!outputTrack) {
+    window.clearInterval(timer);
+    video.pause();
+    video.srcObject = null;
+    video.remove();
+    throw new Error("The mirrored camera track could not be created.");
+  }
+
+  return {
+    track: outputTrack,
+    stop: () => {
+      window.clearInterval(timer);
+      outputStream.getTracks().forEach((track) => track.stop());
+      video.pause();
+      video.srcObject = null;
+      video.remove();
+    },
+  };
+}
 
 function Icon({ name }: { name: "mic" | "camera" | "screen" | "chat" | "phone" | "copy" }) {
   const paths: Record<string, string> = {
@@ -48,20 +116,42 @@ export default function MeetingRoom() {
   const [connection, setConnection] = useState("Connecting");
   const socketRef = useRef<Socket | null>(null);
   const peersRef = useRef(new Map<string, RTCPeerConnection>());
+  const remoteStreamsRef = useRef(new Map<string, MediaStream>());
+  const mediaPreparationRef = useRef<Promise<void> | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const cameraTrackRef = useRef<MediaStreamTrack | null>(null);
+  const mirroredCameraTrackRef = useRef<MediaStreamTrack | null>(null);
+  const stopMirroredCameraRef = useRef<(() => void) | null>(null);
   const screenTrackRef = useRef<MediaStreamTrack | null>(null);
 
   const displayName = useMemo(() => name.trim() || "Guest", [name]);
-  const stopStream = useCallback(() => { streamRef.current?.getTracks().forEach((track) => track.stop()); streamRef.current = null; setLocalStream(null); }, []);
+  const stopStream = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    stopMirroredCameraRef.current?.();
+    stopMirroredCameraRef.current = null;
+    mirroredCameraTrackRef.current = null;
+    streamRef.current = null;
+    setLocalStream(null);
+  }, []);
 
   async function prepareMedia() {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-      streamRef.current = stream; cameraTrackRef.current = stream.getVideoTracks()[0] ?? null; setLocalStream(stream); setMicOn(true); setCameraOn(true);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS, video: true });
+      streamRef.current = stream;
+      cameraTrackRef.current = stream.getVideoTracks()[0] ?? null;
+      if (cameraTrackRef.current) {
+        try {
+          const mirroredOutput = await createMirroredVideoOutput(cameraTrackRef.current);
+          mirroredCameraTrackRef.current = mirroredOutput.track;
+          stopMirroredCameraRef.current = mirroredOutput.stop;
+        } catch (error) {
+          console.error("Unable to prepare the mirrored outgoing camera track.", error);
+        }
+      }
+      setLocalStream(stream); setMicOn(true); setCameraOn(true);
     } catch {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
         streamRef.current = stream; setLocalStream(stream); setCameraOn(false);
       } catch {
         setLocalStream(null); setCameraOn(false); setMicOn(false);
@@ -70,6 +160,8 @@ export default function MeetingRoom() {
   }
 
   async function enterRoom() {
+    if (!mediaPreparationRef.current) mediaPreparationRef.current = prepareMedia();
+    await mediaPreparationRef.current;
     setStage("room");
     const socket = io(process.env.NEXT_PUBLIC_SIGNALING_URL || undefined, { autoConnect: true, transports: ["websocket", "polling"] });
     socketRef.current = socket;
@@ -93,17 +185,34 @@ export default function MeetingRoom() {
     const existing = peersRef.current.get(id); if (existing) return existing;
     const pc = new RTCPeerConnection(ICE_SERVERS);
     peersRef.current.set(id, pc);
-    streamRef.current?.getTracks().forEach((track) => pc.addTrack(track, streamRef.current!));
+    streamRef.current?.getTracks().forEach((track) => {
+      pc.addTrack(
+        track.kind === "video" ? mirroredCameraTrackRef.current ?? track : track,
+        streamRef.current!,
+      );
+    });
     pc.onicecandidate = (event) => { if (event.candidate) socketRef.current?.emit("ice-candidate", { to: id, candidate: event.candidate }); };
-    pc.ontrack = (event) => { const stream = event.streams[0]; if (!stream) return; setPeers((current) => current.some((peer) => peer.id === id) ? current.map((peer) => peer.id === id ? { ...peer, stream } : peer) : [...current, { id, stream, name: remoteName }]); };
+    pc.ontrack = (event) => {
+      let stream = remoteStreamsRef.current.get(id);
+      if (!stream) {
+        stream = new MediaStream();
+        remoteStreamsRef.current.set(id, stream);
+      }
+      if (!stream.getTracks().some((track) => track.id === event.track.id)) stream.addTrack(event.track);
+      setPeers((current) => current.some((peer) => peer.id === id)
+        ? current.map((peer) => peer.id === id ? { ...peer, stream } : peer)
+        : [...current, { id, stream, name: remoteName }]);
+    };
     return pc;
   }
 
-  function removePeer(id: string) { peersRef.current.get(id)?.close(); peersRef.current.delete(id); setPeers((current) => current.filter((peer) => peer.id !== id)); }
+  function removePeer(id: string) { peersRef.current.get(id)?.close(); peersRef.current.delete(id); remoteStreamsRef.current.get(id)?.getTracks().forEach((track) => track.stop()); remoteStreamsRef.current.delete(id); setPeers((current) => current.filter((peer) => peer.id !== id)); }
 
   useEffect(() => {
     const peerConnections = peersRef.current;
-    const timer = window.setTimeout(() => void prepareMedia(), 0);
+    const timer = window.setTimeout(() => {
+      if (!mediaPreparationRef.current) mediaPreparationRef.current = prepareMedia();
+    }, 0);
     return () => {
       window.clearTimeout(timer);
       peerConnections.forEach((pc) => pc.close());
@@ -116,7 +225,7 @@ export default function MeetingRoom() {
   function toggleCamera() { const value = !cameraOn; if (cameraTrackRef.current) cameraTrackRef.current.enabled = value; setCameraOn(value); }
 
   async function toggleShare() {
-    if (sharing) { const camera = cameraTrackRef.current; if (camera) peersRef.current.forEach((pc) => pc.getSenders().find((sender) => sender.track?.kind === "video")?.replaceTrack(camera)); screenTrackRef.current?.stop(); setSharing(false); return; }
+    if (sharing) { const camera = mirroredCameraTrackRef.current ?? cameraTrackRef.current; if (camera) peersRef.current.forEach((pc) => pc.getSenders().find((sender) => sender.track?.kind === "video")?.replaceTrack(camera)); screenTrackRef.current?.stop(); setSharing(false); return; }
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false }); const track = stream.getVideoTracks()[0]; screenTrackRef.current = track;
       peersRef.current.forEach((pc) => pc.getSenders().find((sender) => sender.track?.kind === "video")?.replaceTrack(track)); track.onended = () => { if (sharing) void toggleShare(); }; setSharing(true);
